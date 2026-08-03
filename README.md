@@ -2,17 +2,21 @@
 
 A NixOS module that wraps the upstream [`services.litellm`](https://github.com/NixOS/nixpkgs/blob/master/nixos/modules/services/misc/litellm.nix) module from nixpkgs with:
 
-- **Endpoint shorthand** — define an LLM endpoint once with its models, and the module expands it into `model_list` entries automatically
-- **Age secrets** — pass API keys via agenix-encrypted files; secrets are decrypted at runtime and never written to the Nix store
-- **Master key** — secure the proxy with a LiteLLM master key; required when exposing publicly
-- **Auto-discovery** — query Ollama `/api/tags` or OpenAI-compatible `/v1/models` endpoints to automatically enumerate available models
-- **Cloudflared ingress** — optional public domain routing through a Cloudflare tunnel
+- **Endpoint shorthand** — Define an LLM endpoint once with its models, and the module expands it into `model_list` entries automatically.
+- **Age secrets** — Pass API keys via agenix-encrypted files; secrets are decrypted at runtime and never written to the Nix store.
+- **Master key** — Secure the proxy with an age encrypted LiteLLM master key; required when exposing publicly.
+- **Cloudflared ingress** — Optional public domain routing through a Cloudflare tunnel.
+- **Auto-discovery** — Query Ollama `/api/tags` or OpenAI-compatible `/v1/models` endpoints to automatically enumerate available models.
+- **Per-model context** — Auto-discovered models' capabilities (context window, limits, modalities) via `/api/show` or `/model/info`.
+- **LM Studio adapter** — Auto-discover models and capabilities when consuming client offers native LM Studio support. Beneficial when client custom OpenAI provider requires manual configuration.
 
 ## Usage
 
 Add to your flake inputs:
 
 ```nix
+# inputs.agenix.url = "github:ryantm/agenix";
+# inputs.nixos-cloudflared.url = "github:fortesoft-co/nixos-cloudflared"; 
 inputs.nixos-litellm.url = "github:fortesoft-co/nixos-litellm";
 ```
 
@@ -24,7 +28,11 @@ Import the module:
   ...
 }:
 {
-  imports = [ inputs.nixos-litellm.nixosModules.default ];
+  imports = [
+    # inputs.agenix.nixosModules.default
+    # inputs.nixos-cloudflared.nixosModules.default
+    inputs.nixos-litellm.nixosModules.default
+  ];
 }
 ```
 
@@ -39,26 +47,31 @@ cfg.litellm = {
 
   # Required when domain is set — secures the public endpoint.
   # Generate: openssl rand -hex 24 | sed 's/^/sk-/'
-  masterKeyFile = ./secrets/litellm-master-key.age;
+  # masterKeyFile = ./secrets/litellm-master-key.age;
 
   endpoints = {
-    workstation = {
-      api_base = "http://workstation.local:11434";
+    # Local homelab with auto-discovery and hostname prefix
+    homelab = {
+      api_base = "http://homelab.local:11434";
       wildcard = "ollama";
       autoDiscover = true;
+      prefixDiscoveredModels = true;
       weight = 2;
     };
-    cloud = {
-      api_base = "https://api.ollama.com/v1";
+
+    # Ollama Cloud provider with manual model list
+    ollamaCloud = {
+      provider = "ollama";
+      api_base = "https://ollama.com";
       api_key = "os.environ/OLLAMA_API_KEY";
       models = [ "llama3.1" "mistral" ];
       order = 2;
     };
   };
 
-  secrets = {
-    OLLAMA_API_KEY = ./secrets/litellm_ollama_api_key.age;
-  };
+  # secrets = {
+  #   OLLAMA_API_KEY = ./secrets/litellm_ollama_api_key.age;
+  # };
 };
 ```
 
@@ -93,6 +106,9 @@ Attribute set of LLM endpoints. Each endpoint generates `model_list` entries fro
 ### `cfg.litellm.autoDiscoverInterval`
 How often to re-discover models (systemd timer interval, default `"5min"`). Set to `null` to disable periodic re-discovery.
 
+### `cfg.litellm.prefixDiscoveredModels`
+Append hostname prefix to discovered models (e.g., `endpoint_name:llama3.1`)
+
 ### `cfg.litellm.masterKeyFile`
 Age-encrypted file containing the LiteLLM proxy master key. When set, the module:
 - Declares the age secret and decrypts it at runtime
@@ -114,6 +130,16 @@ Whether to open the firewall for the LiteLLM port.
 
 ### `cfg.litellm.domain`
 Public domain for Cloudflare tunnel ingress. Requires `services.cloudflared` to be enabled. When set, `masterKeyFile` must also be set to secure the public endpoint.
+
+### `cfg.litellm.lmstudioAdapter`
+This adapter makes LiteLLM speak the LM Studio API,
+so any editor with native LM Studio support gets full auto-discovery
+(models, context, capabilities) against LiteLLM without a manual list.
+
+- `enabled` (default: `false`): Whether to enable the LM Studio adapter.
+- `defaultContext` (default: `32768`): The default context size to use for models from the adapter.
+- `capabilities` (default: `[ "tool_use" ]`): The default capabilities to use for models from the adapter.
+- `fetchModelInfo` (default: `true`): Whether to fetch model information from the adapter during discovery. This automatically populates the actual context size and capabilities for each model. For any models not supported, the default context size and capabilities are used.
 
 ## Auto-discovery
 
