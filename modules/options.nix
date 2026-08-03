@@ -285,6 +285,24 @@ in
       '';
     };
 
+    prefixDiscoveredModels = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Prefix each auto-discovered model's `model_name` with the endpoint
+        name (e.g. `workstation:llama3.2`, `ollama_cloud:deepseek-v4-flash`),
+        so the model selector shows which endpoint a model routes to.  This
+        matters when several endpoints expose models with similar names.
+
+        Only affects auto-discovered entries; wildcard catch-alls (e.g.
+        `ollama/*`) and explicitly-listed models keep their existing
+        `model_name`.  Clients must request the prefixed name for discovered
+        models (the wildcard still catches unprefixed `ollama/<model>`).  Off
+        by default to preserve the raw discovered model names for existing
+        setups.
+      '';
+    };
+
     environment = mkOption {
       type = types.attrsOf types.str;
       default = {
@@ -379,6 +397,94 @@ in
 
         Requires cfg.litellm.masterKeyFile to be set — prevents exposing
         an unsecured public endpoint.
+      '';
+    };
+
+    lmstudioAdapter = mkOption {
+      type = types.submodule {
+        options = {
+          enable = mkEnableOption ''
+            an LM Studio-compatible API adapter in front of LiteLLM.  LiteLLM
+            speaks only the OpenAI API, which editors like Zed cannot enumerate
+            through their custom OpenAI-compatible provider (Zed requires a
+            manual model list there).  Zed does, however, auto-discover models
+            for its native `lmstudio` provider via LM Studio's
+            `/api/v0/models` endpoint.
+
+            When enabled, this adapter takes over cfg.litellm.port as the
+            public-facing port (the one cloudflared/firewall already target)
+            and LiteLLM is moved to an internal port (cfg.litellm.port + 1,
+            bound to 127.0.0.1 only).  No separate domain, cloudflared entry,
+            or firewall rule is needed — the existing LiteLLM endpoint now
+            also speaks the LM Studio API.
+
+            The adapter reshapes LiteLLM's /v1/models into LM Studio's
+            /api/v0/models format, rewrites /api/v0/chat/completions to
+            LiteLLM's /v1/chat/completions, and passes every other request
+            (e.g. /v1/*, /health, the LiteLLM UI) straight through.  LM Studio
+            chat is OpenAI chat, so chat needs no translation (including
+            streaming).
+
+            Authentication is end-to-end: the client's Authorization header
+            (Zed's LMSTUDIO_API_KEY, set to the LiteLLM master key) is
+            forwarded to LiteLLM, which enforces it.  The adapter holds no
+            secrets.
+          '';
+
+          defaultContext = mkOption {
+            type = types.ints.unsigned;
+            default = 32768;
+            description = ''
+              Context window (in tokens) reported to Zed for every discovered
+              model.  LiteLLM's OpenAI-shaped /v1/models does not expose context
+              sizes, and Zed's `lmstudio` provider defaults to 2048 when none is
+              reported — so the adapter reports this value for all models.
+
+              Set this to roughly what your backends actually serve (e.g. match
+              Ollama's `num_ctx`) so Zed doesn't over- or under-fill the context.
+              Override per-model in Zed's `lmstudio.available_models` if you need
+              accuracy for specific models.
+            '';
+          };
+
+          capabilities = mkOption {
+            type = types.listOf types.str;
+            default = [ "tool_use" ];
+            example = [ "tool_use" "vision" ];
+            description = ''
+              LM Studio capability strings reported to Zed for every discovered
+              model.  LiteLLM's /v1/models does not expose capabilities, so the
+              adapter reports these defaults.  `tool_use` enables tool calling
+              in Zed; `vision` enables image input.  Only include `vision` if
+              your backends actually accept images, otherwise Zed will offer
+              image attachments that the model rejects.
+            '';
+          };
+
+          fetchModelInfo = mkOption {
+            type = types.bool;
+            default = true;
+            description = ''
+              During discovery, query each Ollama model's `/api/show` to fetch
+              its real context window and tool/vision capabilities, and report
+              those per-model to Zed (via a sidecar file the LM Studio adapter
+              reads) instead of the one-size-fits-all `defaultContext`/
+              `capabilities`.  Models without info (non-Ollama endpoints, or
+              `/api/show` failures) fall back to the defaults.
+
+              Adds one `/api/show` request per discovered Ollama model per
+              discovery cycle.  Only takes effect when the LM Studio adapter
+              is enabled.
+            '';
+          };
+        };
+      };
+      default = { };
+      description = ''
+        LM Studio-compatible adapter that makes LiteLLM also speak the LM
+        Studio API, so editors (e.g. Zed) can auto-discover models via their
+        native `lmstudio` provider instead of maintaining a manual model list.
+        Sits in front of LiteLLM on cfg.litellm.port.
       '';
     };
   };
