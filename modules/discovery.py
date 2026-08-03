@@ -240,8 +240,8 @@ def main():
     discovered_count = 0
     prefix_discovered = config.get("prefix_discovered_models", False)
     # Optionally fetch per-model context + capabilities via /api/show (Ollama)
-    # so the LM Studio adapter can report real per-model values to Zed instead
-    # of a one-size-fits-all default.
+    # so the LM Studio adapter can report real per-model values to the editor
+    # instead of a one-size-fits-all default.
     fetch_model_info = config.get("fetch_model_info", False)
     model_info_path = config.get("model_info_path")
     model_info_map = {}
@@ -317,8 +317,7 @@ def main():
                 to_show.append((model, model_name))
 
         # Fetch per-model context + capabilities via /api/show in parallel
-        # (5 at a time, like Zed's native ollama provider) so a large model
-        # list doesn't make discovery slow.
+        # (5 at a time) so a large model list doesn't make discovery slow.
         if to_show:
             with ThreadPoolExecutor(max_workers=5) as ex:
                 futs = {

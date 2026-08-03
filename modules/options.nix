@@ -422,7 +422,7 @@ in
             streaming).
 
             Authentication is end-to-end: the client's Authorization header
-            (The editor's LMSTUDIO_API_KEY, set to the LiteLLM master key) is
+            (the editor's LMSTUDIO_API_KEY, set to the LiteLLM master key) is
             forwarded to LiteLLM, which enforces it.  The adapter holds no
             secrets.
           '';
@@ -431,11 +431,11 @@ in
             type = types.ints.unsigned;
             default = 32768;
             description = ''
-              Context window (in tokens) reported to Zed for every discovered
-              model.  LiteLLM's OpenAI-shaped /v1/models does not expose context
-              sizes, and editors with an `lmstudio` provider typically default to
-              2048 when none isreported — so the adapter reports this value for
-              all models.
+              Context window (in tokens) reported to the editor for every
+              discovered model.  LiteLLM's OpenAI-shaped /v1/models does not
+              expose context sizes, and editors with an `lmstudio` provider
+              typically default to 2048 when none is reported — so the adapter
+              reports this value for all models.
 
               Set this to roughly what your backends actually serve (e.g. match
               Ollama's `num_ctx`) so your editor doesn't over or under-fill the
@@ -449,12 +449,13 @@ in
             default = [ "tool_use" ];
             example = [ "tool_use" "vision" ];
             description = ''
-              LM Studio capability strings reported to Zed for every discovered
-              model.  LiteLLM's /v1/models does not expose capabilities, so the
-              adapter reports these defaults.  `tool_use` enables tool calling
-              in your editor; `vision` enables image input.  Only include `vision`
-              if your backends actually accept images, otherwise Zed will offer
-              image attachments that the model rejects.
+              LM Studio capability strings reported to the editor for every
+              discovered model.  LiteLLM's /v1/models does not expose
+              capabilities, so the adapter reports these defaults.  `tool_use`
+              enables tool calling in your editor; `vision` enables image input.
+              Only include `vision` if your backends actually accept images,
+              otherwise the editor will offer image attachments that the model
+              rejects.
             '';
           };
 
@@ -478,10 +479,10 @@ in
       };
       default = { };
       description = ''
-        LM Studio-compatible adapter that makes LiteLLM also speak the LM
-        Studio API, so editors (e.g. Zed) can auto-discover models via their
-        native `lmstudio` provider instead of maintaining a manual model list.
-        Sits in front of LiteLLM on cfg.litellm.port.
+        LM Studio-compatible adapter that makes LiteLLM also speak the LM Studio
+        API, so editors with native LM Studio support can auto-discover models
+        (and report context/capabilities) against LiteLLM instead of maintaining
+        a manual model list.  Sits in front of LiteLLM on cfg.litellm.port.
       '';
     };
   };

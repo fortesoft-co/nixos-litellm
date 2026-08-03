@@ -7,8 +7,9 @@ A NixOS module that wraps the upstream [`services.litellm`](https://github.com/N
 - **Master key** — Secure the proxy with an age encrypted LiteLLM master key; required when exposing publicly.
 - **Cloudflared ingress** — Optional public domain routing through a Cloudflare tunnel.
 - **Auto-discovery** — Query Ollama `/api/tags` or OpenAI-compatible `/v1/models` endpoints to automatically enumerate available models.
-- **Per-model context** — Auto-discovered models' capabilities (context window, limits, modalities) via `/api/show` or `/model/info`.
-- **LM Studio adapter** — Auto-discover models and capabilities when consuming client offers native LM Studio support. Beneficial when client custom OpenAI provider requires manual configuration.
+- **Per-model context** — Auto-discovered models report real context windows and capabilities (tools/vision) per model, via Ollama `/api/show` or LiteLLM's `/model/info` registry.
+- **mDNS hostname resolution** — `http://*.local` endpoint hosts (avahi/mDNS) are resolved to IPs at discovery time, since LiteLLM's async resolver can't do mDNS.
+- **LM Studio adapter** — Expose an LM Studio-compatible API so editors with native LM Studio support auto-discover models and capabilities, instead of the manual model list their custom OpenAI provider usually requires.
 
 ## Usage
 
@@ -49,13 +50,15 @@ cfg.litellm = {
   # Generate: openssl rand -hex 24 | sed 's/^/sk-/'
   # masterKeyFile = ./secrets/litellm-master-key.age;
 
+  # Prefix discovered model names with the endpoint name (e.g. homelab:llama3.1)
+  prefixDiscoveredModels = true;
+
   endpoints = {
-    # Local homelab with auto-discovery and hostname prefix
+    # Local homelab with auto-discovery
     homelab = {
       api_base = "http://homelab.local:11434";
       wildcard = "ollama";
       autoDiscover = true;
-      prefixDiscoveredModels = true;
       weight = 2;
     };
 
@@ -136,10 +139,10 @@ This adapter makes LiteLLM speak the LM Studio API,
 so any editor with native LM Studio support gets full auto-discovery
 (models, context, capabilities) against LiteLLM without a manual list.
 
-- `enabled` (default: `false`): Whether to enable the LM Studio adapter.
+- `enable` (default: `false`): Whether to enable the LM Studio adapter.
 - `defaultContext` (default: `32768`): The default context size to use for models from the adapter.
 - `capabilities` (default: `[ "tool_use" ]`): The default capabilities to use for models from the adapter.
-- `fetchModelInfo` (default: `true`): Whether to fetch model information from the adapter during discovery. This automatically populates the actual context size and capabilities for each model. For any models not supported, the default context size and capabilities are used.
+- `fetchModelInfo` (default: `true`): Whether to fetch real context windows and capabilities per model during discovery (via `/api/show`/`/model/info`). For any models without info, `defaultContext` and `capabilities` are used.
 
 ## Auto-discovery
 
