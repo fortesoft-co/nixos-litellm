@@ -12,8 +12,11 @@ Routes:
                                  Studio's {data:[{id, object, type, publisher,
                                  compatibility_type, state, ...}]} format.
   POST /api/v0/chat/completions → LiteLLM POST /v1/chat/completions (path
-                                 rewrite only; LM Studio chat is OpenAI chat,
-                                 so the body and streaming pass through).
+                                 rewrite; text streams through unchanged,
+                                 tool-call chunks are reshaped on the fly to
+                                 fix LiteLLM's Ollama streaming bug where
+                                 `function.arguments` arrives as a JSON object
+                                 instead of a string).
   *    /*                       → forwarded to LiteLLM unchanged (so /v1/*,
                                  /health, the LiteLLM UI, etc. all work).
 
@@ -170,9 +173,155 @@ async def get_models(req):
     return web.json_response({"data": out})
 
 
+class ChatStreamRewriter:
+    """Stateful rewriter for OpenAI chat-completion SSE chunks.
+
+    Fixes two LiteLLM/Ollama streaming bugs that break strict clients like Zed's
+    LM Studio provider:
+
+    1. `function.arguments` arrives as a JSON *object* (Ollama returns a dict)
+       instead of a JSON *string*.  Zed's `FunctionChunk.arguments` is
+       `Option<String>`, so an object makes the whole SSE chunk fail to
+       deserialize.  (The non-streaming path is fine — LiteLLM `transform_response`
+       explicitly `json.dumps`s the args.)
+
+    2. The tool call arrives in its own chunk with *no* `finish_reason`, and the
+       trailing `done` chunk carries Ollama's `done_reason: "stop"`.  LiteLLM's
+       `chunk_parser` only overrides the finish reason to `"tool_calls"` when the
+       tool calls and `done: true` are in the *same* chunk, so here the stream ends
+       with `finish_reason: "stop"`.  Zed only emits a tool-use event on
+       `finish_reason == "tool_calls"`; with `"stop"` it ends the turn and the
+       accumulated tool call is silently dropped — exactly the symptom of "the
+       agent stops instead of making the tool call".
+
+    We track whether any `delta.tool_calls` was seen in the stream and, when the
+    final chunk arrives with a non-`tool_calls` finish reason, rewrite it to
+    `"tool_calls"`.  We also backfill `index` (Zed requires it, no serde default)
+    and `type` defensively.
+    """
+
+    def __init__(self):
+        self.saw_tool_calls = False
+        self.finish_emitted = False
+
+    def process(self, line):
+        """Convert one upstream SSE line into bytes to write downstream.
+
+        Only `data:` payloads are reshaped, and only re-serialized when they were
+        actually mutated; everything else passes through verbatim.  Returns None
+        for blank separator lines (we re-emit our own `\n\n` framing per line).
+        """
+        s = line.rstrip(b"\r")
+        if not s:
+            return None
+        if s.startswith(b"data: "):
+            payload = s[6:]
+        elif s.startswith(b"data:"):
+            payload = s[5:]
+        else:
+            # comments / event lines etc. — clients ignore them; preserve as-is
+            return s + b"\n\n"
+        if payload.strip() == b"[DONE]":
+            return b"data: [DONE]\n\n"
+        try:
+            obj = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            return b"data: " + payload + b"\n\n"
+        if self._rewrite(obj):
+            payload = json.dumps(obj).encode()
+        return b"data: " + payload + b"\n\n"
+
+    def _rewrite(self, obj):
+        """Mutate `obj` in place; return True if it changed."""
+        changed = False
+        for choice in obj.get("choices") or []:
+            delta = choice.get("delta") or {}
+            tcs = delta.get("tool_calls")
+            if tcs:
+                self.saw_tool_calls = True
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    if "index" not in tc:
+                        tc["index"] = 0
+                        changed = True
+                    if not tc.get("type"):
+                        tc["type"] = "function"
+                        changed = True
+                    fn = tc.get("function")
+                    if not isinstance(fn, dict):
+                        fn = {}
+                        tc["function"] = fn
+                        changed = True
+                    args = fn.get("arguments")
+                    if args is not None and not isinstance(args, str):
+                        # Ollama sends a dict (or sometimes a list); OpenAI wants
+                        # a JSON string the client reassembles/appends per chunk.
+                        fn["arguments"] = json.dumps(args)
+                        changed = True
+            # Rewrite the trailing finish reason: if a tool call was streamed
+            # earlier but the final chunk says "stop" (Ollama's done_reason),
+            # force it to "tool_calls" so the client fires the tool-use event.
+            # Only act on the first finish reason we see, to avoid emitting a
+            # second "tool_calls" if the provider already set one.
+            fr = choice.get("finish_reason")
+            if fr and not self.finish_emitted:
+                self.finish_emitted = True
+                if self.saw_tool_calls and fr != "tool_calls":
+                    choice["finish_reason"] = "tool_calls"
+                    changed = True
+        return changed
+
+
 async def chat_completions(req):
-    """LM Studio chat = OpenAI chat; rewrite the path and pass through."""
-    return await stream_proxy(req, req.app["upstream"], path="/v1/chat/completions")
+    """LM Studio chat = OpenAI chat, with the path rewritten to /v1/chat/completions.
+
+    Text chunks stream through unchanged.  Tool-call chunks are reshaped on the
+    fly to fix LiteLLM's Ollama streaming bugs (arguments object → string, and
+    trailing `finish_reason: "stop"` → `"tool_calls"`); see `ChatStreamRewriter`.
+    Non-SSE responses (e.g. upstream errors, or a client that set stream=false)
+    are passed through byte-for-byte.
+    """
+    upstream = req.app["upstream"]
+    target = upstream + "/v1/chat/completions"
+    if req.query_string:
+        target += "?" + req.query_string
+    body = await req.read() if req.body_exists else None
+    headers = client_headers(req)
+    timeout = ClientTimeout(total=None)
+    async with ClientSession(timeout=timeout) as session:
+        async with session.post(target, data=body, headers=headers) as r:
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            is_sse = "text/event-stream" in ctype
+            resp_headers = {
+                k: v for k, v in r.headers.items()
+                if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+            }
+            resp = web.StreamResponse(status=r.status, headers=resp_headers)
+            if is_sse:
+                resp.content_type = "text/event-stream"
+            await resp.prepare(req)
+            if not is_sse:
+                # Not a stream (error body, or stream=false): forward verbatim.
+                async for chunk in r.content.iter_any():
+                    await resp.write(chunk)
+                await resp.write_eof()
+                return resp
+            rewriter = ChatStreamRewriter()
+            buf = b""
+            async for chunk in r.content.iter_any():
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    out = rewriter.process(line)
+                    if out is not None:
+                        await resp.write(out)
+            if buf.strip():
+                out = rewriter.process(buf)
+                if out is not None:
+                    await resp.write(out)
+            await resp.write_eof()
+            return resp
 
 
 async def catch_all(req):
