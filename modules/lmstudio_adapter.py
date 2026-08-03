@@ -3,8 +3,9 @@
 LiteLLM LM Studio-compatible adapter.
 
 Sits in front of a LiteLLM proxy (OpenAI-compatible) and makes it also speak
-the subset of LM Studio's API that Zed's `lmstudio` provider uses, so Zed can
-auto-discover models (it cannot enumerate custom OpenAI-compatible providers).
+the subset of LM Studio's API that an editor's `lmstudio` provider uses, so
+the editor can auto-discover models (they typically cannot enumerate custom
+OpenAI-compatible providers).
 
 Routes:
   GET  /api/v0/models          → LiteLLM GET /v1/models, reshaped to LM
@@ -16,9 +17,8 @@ Routes:
   *    /*                       → forwarded to LiteLLM unchanged (so /v1/*,
                                  /health, the LiteLLM UI, etc. all work).
 
-Auth is end-to-end: the client's Authorization header (Zed's
-LMSTUDIO_API_KEY = the LiteLLM master key) is forwarded to LiteLLM, which
-enforces it.  The adapter holds no secrets.
+Auth is end-to-end: the client's Authorization header (editor's LMSTUDIO_API_KEY)
+is forwarded to LiteLLM, which enforces it. The adapter holds no secrets.
 
 Usage: lmstudio_adapter.py --listen HOST --port PORT --upstream http://host:port
 """
@@ -190,7 +190,7 @@ def main():
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--upstream", required=True)
     p.add_argument("--default-context", type=int, default=32768,
-                   help="context window reported to Zed for every model")
+                   help="context window reported to editor for every model")
     p.add_argument("--capabilities", default="tool_use",
                    help="comma-separated LM Studio capabilities, e.g. tool_use,vision")
     p.add_argument("--model-info", default=None,

@@ -162,7 +162,7 @@ let
     # model selector shows which endpoint a model routes to.
     prefix_discovered_models = cfg.prefixDiscoveredModels;
     # Fetch per-model context + capabilities via /api/show during discovery so
-    # the LM Studio adapter can report real per-model values to Zed.
+    # the LM Studio adapter can report real per-model context/capabilities to editors.
     fetch_model_info = adapterEnabled && cfg.lmstudioAdapter.fetchModelInfo;
     model_info_path = "/run/litellm-discovery/model_info.json";
     # Separate script that rewrites http://*.local api_base hostnames to their
@@ -186,7 +186,7 @@ let
   # When the adapter is enabled, it takes over cfg.port as the public port
   # (the one cloudflared/firewall already target) and LiteLLM is moved to an
   # internal port bound to 127.0.0.1 only.  The adapter forwards to LiteLLM
-  # and reshapes /api/v0/models for Zed's `lmstudio` provider.
+  # and reshapes /api/v0/models for editors with native LM Studio support.
   adapterEnabled = cfg.lmstudioAdapter.enable;
   litellmInternalPort = cfg.port + 1;
   # The host/port the LiteLLM process itself binds to.
@@ -316,11 +316,10 @@ in
     })
 
     # ── Auto-discovery: litellm depends on the discovery service ──────────────
-    # Discovery (+ hostname resolution) is handled entirely by the
-    # litellm-discovery oneshot below, which runs `before=litellm` at boot and
-    # on the periodic timer.  litellm therefore no longer runs discovery as an
-    # ExecStartPre — it just reads the generated /run/litellm-discovery/config.yaml.
-    # Upstream's tiktoken/UI ExecStartPre scripts remain untouched.
+    # Discovery (+ hostname resolution) is handled by the litellm-discovery
+    # oneshot below, which runs `before=litellm` at boot and on the periodic timer.
+    # litellm therefore reads the generated /run/litellm-discovery/config.yaml.
+    # Upstream's tiktoken/UI ExecStartPre scripts are left in place.
     (mkIf hasAutoDiscover {
       systemd.services.litellm.after = [ "litellm-discovery.service" ];
     })
@@ -402,7 +401,7 @@ in
     # Sits in front of LiteLLM on cfg.port (cloudflared/firewall already target
     # cfg.port, so no separate exposure config is needed).  LiteLLM is moved to
     # 127.0.0.1:(cfg.port+1) — see the upstream service block above.  The adapter
-    # reshapes /api/v0/models for Zed's `lmstudio` provider, rewrites
+    # reshapes /api/v0/models for an editor's `lmstudio` provider, rewrites
     # /api/v0/chat/completions to /v1/chat/completions, and proxies everything
     # else (incl. /v1/*, /health, the LiteLLM UI) straight through.  Forwards the
     # client's Authorization header so LiteLLM enforces auth end-to-end.
