@@ -47,6 +47,44 @@ def response_headers(resp):
     return {k: v for k, v in resp.headers.items() if k.lower() not in HOP_BY_HOP}
 
 
+# LM Studio parameter names that differ from OpenAI's.  The adapter receives
+# requests in LM Studio format (via /api/v0/chat/completions) and forwards
+# them to LiteLLM's OpenAI-compatible /v1/chat/completions.  Without
+# translation, LM Studio-specific parameters pass through to the provider
+# and cause errors — e.g. maxOutputTokens:-1 (LM Studio's sentinel for "use
+# model default") reaches Vertex AI as-is and is rejected.
+LMSTUDIO_PARAM_MAP = {
+    "maxOutputTokens": "max_tokens",
+}
+# Sentinel values that mean "not set / use model default" in LM Studio.
+# These are stripped so the provider uses its own default.
+SENTINEL_VALUES = {-1, 0, None}
+
+
+def translate_lmstudio_body(body_bytes):
+    """Translate LM Studio chat-completion parameters to OpenAI format.
+
+    Returns bytes (possibly the original bytes unchanged if no translation
+    was needed or the body isn't valid JSON).
+    """
+    if not body_bytes:
+        return body_bytes
+    try:
+        body = json.loads(body_bytes)
+    except (json.JSONDecodeError, ValueError):
+        return body_bytes
+    changed = False
+    for lm_name, oai_name in LMSTUDIO_PARAM_MAP.items():
+        if lm_name in body:
+            val = body.pop(lm_name)
+            if val not in SENTINEL_VALUES and oai_name not in body:
+                body[oai_name] = val
+            changed = True
+    if not changed:
+        return body_bytes
+    return json.dumps(body).encode()
+
+
 async def stream_proxy(req, upstream, *, path=None):
     """Forward `req` to `{upstream}{path or req.path}` and stream the response
     back unchanged.  Used for the catch-all passthrough and for the LM Studio
@@ -287,6 +325,8 @@ async def chat_completions(req):
     if req.query_string:
         target += "?" + req.query_string
     body = await req.read() if req.body_exists else None
+    if body:
+        body = translate_lmstudio_body(body)
     headers = client_headers(req)
     timeout = ClientTimeout(total=None)
     async with ClientSession(timeout=timeout) as session:

@@ -36,6 +36,14 @@ let
   secretsRuntimeDir = "/run/litellm-secrets";
   secretsEnvFile = "${secretsRuntimeDir}/secrets.env";
 
+  # JSON secrets are copied to this subdirectory and the env var is set to
+  # the file path instead of the file contents.  This avoids systemd's
+  # EnvironmentFile backslash escape handling corrupting multi-line JSON
+  # (e.g. GCP service account keys with \n in the private key).  The
+  # directory is chowned to the litellm DynamicUser at service start (see
+  # chownJsonSecretsScript below) so files are not world-readable.
+  jsonSecretsDir = "${secretsRuntimeDir}/json";
+
   # Map each secret to its age.secrets path for use in the secrets oneshot.
   # Guarded by hasAgenix — returns [] if agenix is not imported.
   secretEntries =
@@ -55,19 +63,40 @@ let
   # starts — the DynamicUser litellm process never reads the file directly,
   # it receives the values as environment variables.
   #
-  # Each secret is written as KEY=<value> with a trailing newline.
-  # The value is read from the age-decrypted file and written as-is
-  # (no shell expansion, no quoting issues).  systemd EnvironmentFile
-  # does not support shell substitution — the values must be literal.
+  # For each secret, the script detects whether the decrypted content is
+  # JSON (via jq -e .).  JSON secrets are copied to ${jsonSecretsDir}/ and
+  # the env var is set to the file path — consumers like LiteLLM's
+  # vertex_credentials check os.path.exists() and read the file.  Non-JSON
+  # secrets are written as KEY=<value> as before.  This avoids systemd's
+  # EnvironmentFile backslash escape handling corrupting multi-line JSON.
   secretsEnvScript = pkgs.writeShellScript "litellm-secrets-env" ''
     set -eu
     : > ${secretsEnvFile}
+    mkdir -p ${jsonSecretsDir}
     ${concatStringsSep "\n" (map (entry: ''
-      printf '${entry.name}=' >> ${secretsEnvFile}
-      cat ${entry.path} >> ${secretsEnvFile}
-      printf '\n' >> ${secretsEnvFile}
+      if ${pkgs.jq}/bin/jq -e . ${entry.path} >/dev/null 2>&1; then
+        cp ${entry.path} ${jsonSecretsDir}/${entry.name}.json
+        chmod 600 ${jsonSecretsDir}/${entry.name}.json
+        printf '${entry.name}=${jsonSecretsDir}/${entry.name}.json\n' >> ${secretsEnvFile}
+      else
+        printf '${entry.name}=' >> ${secretsEnvFile}
+        cat ${entry.path} >> ${secretsEnvFile}
+        printf '\n' >> ${secretsEnvFile}
+      fi
     '') secretEntries)}
     chmod 600 ${secretsEnvFile}
+  '';
+
+  # Runs as root (via ExecStartPre + prefix) before litellm starts.  chowns
+  # the JSON secrets directory to the DynamicUser's UID/GID so only the
+  # litellm process can read the files.  The DynamicUser's UID is obtained
+  # from /run/litellm/ (the litellm RuntimeDirectory, which systemd creates
+  # and chowns to the DynamicUser before ExecStartPre runs).
+  chownJsonSecretsScript = pkgs.writeShellScript "litellm-chown-json-secrets" ''
+    set -eu
+    uid=$(${pkgs.coreutils}/bin/stat -c %u /run/litellm)
+    gid=$(${pkgs.coreutils}/bin/stat -c %g /run/litellm)
+    ${pkgs.coreutils}/bin/chown -R "$uid:$gid" ${jsonSecretsDir}
   '';
 
   # ── Endpoint expansion ──────────────────────────────────────────────────────
@@ -87,14 +116,20 @@ let
       prefix = providerPrefix ep.provider;
       info = { id = name; } // ep.model_info;
 
+      # Ollama endpoints ignore api_key but LiteLLM historically requires one
+      # to be present.  Auto-fill "ollama" so users don't have to set it.
+      effectiveApiKey =
+        if ep.api_key != null then ep.api_key
+        else if ep.provider == "ollama" then "ollama"
+        else null;
+
       mkEntry = model_name: model_value:
         {
           inherit model_name;
-          litellm_params = {
-            model = model_value;
-            api_base = ep.api_base;
-            api_key = ep.api_key;
-          };
+          litellm_params = { model = model_value; }
+            // optionalAttrs (ep.api_base != null) { api_base = ep.api_base; }
+            // optionalAttrs (effectiveApiKey != null) { api_key = effectiveApiKey; }
+            // ep.litellm_params;
           model_info = info;
         }
         // optionalAttrs (ep.weight != 1) { weight = ep.weight; }
@@ -140,7 +175,8 @@ let
     let
       m = builtins.match "os.environ/(.+)" api_key;
     in
-    if m != null && hasAgenix then
+    if api_key == null then null
+    else if m != null && hasAgenix then
       config.age.secrets.${secretName (builtins.head m)}.path
     else
       null;
@@ -171,7 +207,7 @@ let
     resolver_path = ./resolver.py;
     endpoints = mapAttrsToList (name: ep: {
       inherit name;
-      inherit (ep) api_base api_key weight order model_info;
+      inherit (ep) api_base api_key weight order model_info litellm_params;
       provider_prefix = providerPrefix ep.provider;
       discovery_type = discoveryType ep.provider;
       api_key_path = resolveApiKeyPath ep.api_key;
@@ -219,6 +255,14 @@ in
           message = ''
             cfg.litellm.endpoints.*.autoDiscover requires the upstream
             services.litellm module from nixpkgs to be available.
+          '';
+        }
+        {
+          assertion = !hasAutoDiscover || all (ep: ep.api_base != null) (attrValues autoDiscoverEndpoints);
+          message = ''
+            cfg.litellm.endpoints.*.autoDiscover requires api_base to be set
+            (the discovery script needs a URL to query).  Set api_base or
+            disable autoDiscover for that endpoint.
           '';
         }
         {
@@ -313,6 +357,14 @@ in
         requires = [ "litellm-secrets.service" ];
         after = [ "litellm-secrets.service" ];
       };
+
+      # Chown JSON secrets directory to the DynamicUser so only litellm can
+      # read them.  Runs as root (via + prefix) before litellm starts.  The
+      # DynamicUser's UID/GID is obtained from /run/litellm/ (the litellm
+      # RuntimeDirectory, which systemd creates and chowns to the DynamicUser
+      # before ExecStartPre runs).
+      systemd.services.litellm.serviceConfig.ExecStartPre =
+        mkBefore [ "+${chownJsonSecretsScript}" ];
     })
 
     # ── Auto-discovery: litellm depends on the discovery service ──────────────

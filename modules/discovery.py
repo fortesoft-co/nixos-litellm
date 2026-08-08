@@ -296,13 +296,26 @@ def main():
                 continue
             existing.add(key)
 
+            # api_base / api_key are only emitted when set, so providers
+            # that don't use them (e.g. vertex_ai) get clean litellm_params.
+            # For ollama, auto-fill "ollama" as the api_key since LiteLLM
+            # historically requires one to be present even though local
+            # Ollama ignores it.
+            effective_key = ep.get("resolved_api_key") or api_key
+            if effective_key is None and discovery_type == "ollama":
+                effective_key = "ollama"
+            litellm_params = {"model": f"{ep['provider_prefix']}{model}"}
+            if api_base is not None:
+                litellm_params["api_base"] = api_base
+            if effective_key is not None:
+                litellm_params["api_key"] = effective_key
+            # Merge user-provided litellm_params last so they take precedence
+            # (matching the Nix expandEndpoint behaviour) and can override
+            # model/api_base/api_key for provider-specific formats.
+            litellm_params.update(ep.get("litellm_params", {}))
             entry = {
                 "model_name": model_name,
-                "litellm_params": {
-                    "model": f"{ep['provider_prefix']}{model}",
-                    "api_base": api_base,
-                    "api_key": ep.get("resolved_api_key") or api_key or "ollama",
-                },
+                "litellm_params": litellm_params,
                 "model_info": ep.get("model_info", {}),
             }
             if ep.get("weight", 1) != 1:
