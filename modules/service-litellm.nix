@@ -198,6 +198,26 @@ let
   # adapter doesn't pull aiohttp into discovery's closure.
   adapterEnv = pkgs.python3.withPackages (ps: [ ps.aiohttp ]);
 
+  # Override the litellm package to use the fix/ollama-model-info-capabilities
+  # fork.  The fork uses maturin as the build backend, but nixpkgs' litellm
+  # package is set up for uv-build; patch pyproject.toml to match.  The Rust
+  # bridge is not built (uv-build skips it), but litellm falls back to Python
+  # implementations when the native extension is absent.
+  litellmPackage = pkgs.litellm.overrideAttrs (old: {
+    version = "1.97.0-fork";
+    src = pkgs.fetchFromGitHub {
+      owner = "fortesoftware";
+      repo = "litellm";
+      rev = "2b89bdeed1";
+      hash = "sha256-WAHjObD2AIE3U6NenZ/ttpWsgdFkPFz6c24wm0Pcww0=";
+    };
+    postPatch = ''
+      substituteInPlace pyproject.toml \
+        --replace-fail 'requires = ["maturin==1.9.4"]' 'requires = ["uv_build"]' \
+        --replace-fail 'build-backend = "maturin"' 'build-backend = "uv_build"'
+    '';
+  });
+
 in
 {
   imports = [ ./options.nix ];
@@ -253,7 +273,7 @@ in
     {
       services.litellm = {
         enable = true;
-        package = cfg.package;
+        package = litellmPackage;
         stateDir = cfg.stateDir;
         host = litellmHost;
         port = litellmPort;
@@ -334,7 +354,7 @@ in
     # enabled — without it, the upstream config path is correct.
     (mkIf hasAutoDiscover {
       systemd.services.litellm.serviceConfig.ExecStart =
-        mkForce "${lib.getExe cfg.package} --host \"${litellmHost}\" --port ${toString litellmPort} --config /run/litellm-discovery/config.yaml";
+        mkForce "${lib.getExe litellmPackage} --host \"${litellmHost}\" --port ${toString litellmPort} --config /run/litellm-discovery/config.yaml";
 
       # Graceful shutdown timeout: give in-flight requests up to 60 seconds
       # to complete before SIGKILL.  uvicorn handles SIGTERM by draining
