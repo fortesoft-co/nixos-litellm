@@ -197,10 +197,6 @@ let
     # Prefix auto-discovered model_names with the endpoint name so the
     # model selector shows which endpoint a model routes to.
     prefix_discovered_models = cfg.prefixDiscoveredModels;
-    # Fetch per-model context + capabilities via /api/show during discovery so
-    # the LM Studio adapter can report real per-model context/capabilities to editors.
-    fetch_model_info = adapterEnabled && cfg.lmstudioAdapter.fetchModelInfo;
-    model_info_path = "/run/litellm-discovery/model_info.json";
     # Separate script that rewrites http://*.local api_base hostnames to their
     # resolved IPs (glibc/avahi), since LiteLLM resolves via aiodns (no mDNS).
     # Invoked by discovery.py after writing the merged config and before hashing.
@@ -217,22 +213,6 @@ let
   # When host is "0.0.0.0" (all interfaces), cloudflared should connect via
   # localhost.  Otherwise, use the configured host address.
   localAddress = if cfg.host == "0.0.0.0" then "127.0.0.1" else cfg.host;
-
-  # ── LM Studio adapter (optional, sits in front of LiteLLM) ────────────────
-  # When the adapter is enabled, it takes over cfg.port as the public port
-  # (the one cloudflared/firewall already target) and LiteLLM is moved to an
-  # internal port bound to 127.0.0.1 only.  The adapter forwards to LiteLLM
-  # and reshapes /api/v0/models for editors with native LM Studio support.
-  adapterEnabled = cfg.lmstudioAdapter.enable;
-  litellmInternalPort = cfg.port + 1;
-  # The host/port the LiteLLM process itself binds to.
-  litellmHost = if adapterEnabled then "127.0.0.1" else cfg.host;
-  litellmPort = if adapterEnabled then litellmInternalPort else cfg.port;
-
-  # Python env for the adapter.  aiohttp gives an async server + client with
-  # streaming passthrough.  Separate from pythonEnv (discovery) so the
-  # adapter doesn't pull aiohttp into discovery's closure.
-  adapterEnv = pkgs.python3.withPackages (ps: [ ps.aiohttp ]);
 
   # Override the litellm package to use the fix/ollama-model-info-capabilities
   # fork.  The fork uses maturin as the build backend, but nixpkgs' litellm
@@ -308,19 +288,13 @@ in
     # ── Upstream LiteLLM service ─────────────────────────────────────────────
     # Delegates core configuration (systemd unit, tiktoken cache, sandbox
     # hardening, config.yaml generation, etc.) to the native nixpkgs module.
-    #
-    # When the LM Studio adapter is enabled, LiteLLM is moved to an internal
-    # port (cfg.port + 1) bound to 127.0.0.1 only — the adapter takes over
-    # cfg.port as the public port, so LiteLLM must not be directly exposed
-    # (and its firewall opening is suppressed; the adapter's port is opened
-    # instead below).
     {
       services.litellm = {
         enable = true;
         package = litellmPackage;
         stateDir = cfg.stateDir;
-        host = litellmHost;
-        port = litellmPort;
+        host = cfg.host;
+        port = cfg.port;
         settings = cfg.settings // {
           model_list = cfg.settings.model_list ++ endpointsModelList;
         } // (optionalAttrs hasMasterKey {
@@ -329,7 +303,7 @@ in
           };
         });
         environment = cfg.environment;
-        openFirewall = if adapterEnabled then false else cfg.openFirewall;
+        openFirewall = cfg.openFirewall;
         # We handle environmentFile ourselves to combine it with age secrets.
         environmentFile = null;
       };
@@ -398,15 +372,13 @@ in
 
     # ── Auto-discovery: use runtime config ────────────────────────────────────
     # Override the upstream ExecStart to point at the merged config in
-    # /run/litellm-discovery/ instead of the Nix store path.  Uses the
-    # effective LiteLLM bind address (127.0.0.1:internal-port when the LM
-    # Studio adapter is enabled, cfg.host:cfg.port otherwise).  The upstream
+    # /run/litellm-discovery/ instead of the Nix store path. The upstream
     # module sets ExecStart with a plain assignment (priority 100), so we use
     # mkForce (priority 50) to win.  Only applied when autoDiscover is
     # enabled — without it, the upstream config path is correct.
     (mkIf hasAutoDiscover {
       systemd.services.litellm.serviceConfig.ExecStart =
-        mkForce "${lib.getExe litellmPackage} --host \"${litellmHost}\" --port ${toString litellmPort} --config /run/litellm-discovery/config.yaml";
+        mkForce "${lib.getExe litellmPackage} --host \"${cfg.host}\" --port ${toString cfg.port} --config /run/litellm-discovery/config.yaml";
 
       # Graceful shutdown timeout: give in-flight requests up to 60 seconds
       # to complete before SIGKILL.  uvicorn handles SIGTERM by draining
@@ -456,10 +428,7 @@ in
     })
 
     # ── Cloudflared ingress ──────────────────────────────────────────────────
-    # Directs the public domain at cfg.port.  When the LM Studio adapter is
-    # enabled it listens on cfg.port (and LiteLLM is moved to an internal
-    # port), so this ingress transparently routes through the adapter; when
-    # disabled, it routes straight to LiteLLM.  Uses the configured host
+    # Directs the public domain at cfg.port. Uses the configured host
     # address, falling back to localhost when the service binds to all
     # interfaces (0.0.0.0).
     (mkIf (config.services.cloudflared.enable && cfg.domain != null) {
@@ -469,35 +438,8 @@ in
       };
     })
 
-    # ── LM Studio adapter ─────────────────────────────────────────────────────
-    # Sits in front of LiteLLM on cfg.port (cloudflared/firewall already target
-    # cfg.port, so no separate exposure config is needed).  LiteLLM is moved to
-    # 127.0.0.1:(cfg.port+1) — see the upstream service block above.  The adapter
-    # reshapes /api/v0/models for an editor's `lmstudio` provider, rewrites
-    # /api/v0/chat/completions to /v1/chat/completions, and proxies everything
-    # else (incl. /v1/*, /health, the LiteLLM UI) straight through.  Forwards the
-    # client's Authorization header so LiteLLM enforces auth end-to-end.
-    (mkIf adapterEnabled {
-      systemd.services.litellm-lmstudio-adapter = {
-        description = "LM Studio-compatible API adapter in front of LiteLLM";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "litellm.service" ];
-        wants = [ "litellm.service" ];
-        serviceConfig = {
-          Type = "simple";
-          DynamicUser = true;
-          PrivateTmp = true;
-          ExecStart = "${adapterEnv}/bin/python3 ${./lmstudio_adapter.py} --listen ${cfg.host} --port ${toString cfg.port} --upstream http://${litellmHost}:${toString litellmPort} --default-context ${toString cfg.lmstudioAdapter.defaultContext} --capabilities ${concatStringsSep "," cfg.lmstudioAdapter.capabilities} --model-info /run/litellm-discovery/model_info.json";
-          Restart = "on-failure";
-          RestartSec = "5s";
-        };
-      };
-    })
-
-    # Open the adapter's (public) port for LAN access.  When the adapter is
-    # enabled, LiteLLM is internal-only and the upstream openFirewall is
-    # suppressed (see above), so cfg.port (the adapter) is opened here instead.
-    (mkIf (adapterEnabled && cfg.openFirewall) {
+    # Open the LiteLLM port for LAN access.
+    (mkIf (cfg.openFirewall) {
       networking.firewall.allowedTCPPorts = [ cfg.port ];
     })
   ]);

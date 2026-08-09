@@ -9,7 +9,6 @@ A NixOS module that wraps the upstream [`services.litellm`](https://github.com/N
 - **Auto-discovery** — Query Ollama `/api/tags` or OpenAI-compatible `/v1/models` endpoints to automatically enumerate available models.
 - **Per-model context** — Auto-discovered models report real context windows and capabilities (tools/vision) per model, via Ollama `/api/show` or LiteLLM's `/model/info` registry.
 - **mDNS hostname resolution** — `http://*.local` endpoint hosts (avahi/mDNS) are resolved to IPs at discovery time, since LiteLLM's async resolver can't do mDNS.
-- **LM Studio adapter** — Expose an LM Studio-compatible API so editors with native LM Studio support auto-discover models and capabilities, instead of the manual model list their custom OpenAI provider usually requires.
 
 ## Usage
 
@@ -133,16 +132,6 @@ Whether to open the firewall for the LiteLLM port.
 
 ### `cfg.litellm.domain`
 Public domain for Cloudflare tunnel ingress. Requires `services.cloudflared` to be enabled. When set, `masterKeyFile` must also be set to secure the public endpoint.
-
-### `cfg.litellm.lmstudioAdapter`
-This adapter makes LiteLLM speak the LM Studio API,
-so any editor with native LM Studio support gets full auto-discovery
-(models, context, capabilities) against LiteLLM without a manual list.
-
-- `enable` (default: `false`): Whether to enable the LM Studio adapter.
-- `defaultContext` (default: `32768`): The default context size to use for models from the adapter.
-- `capabilities` (default: `[ "tool_use" ]`): The default capabilities to use for models from the adapter.
-- `fetchModelInfo` (default: `true`): Whether to fetch real context windows and capabilities per model during discovery (via `/api/show`/`/model/info`). For any models without info, `defaultContext` and `capabilities` are used.
 
 ## Auto-discovery
 

@@ -74,48 +74,6 @@ def discover_ollama(api_base, timeout=10):
               file=sys.stderr)
         return None
 
-
-def show_ollama(api_base, model, api_key=None, timeout=10):
-    """Query Ollama's /api/show for a single model to get its real context
-    window and capabilities.
-
-    Returns (context_length, capabilities) where context_length is an int or
-    None, and capabilities is a list of LM Studio-style capability strings
-    (e.g. ["tool_use", "vision"]).  On failure returns (None, []).
-    """
-    try:
-        url = f"{api_base.rstrip('/')}/api/show"
-        req = urllib.request.Request(
-            url,
-            data=json.dumps({"model": model}).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        # Local Ollama needs no auth (its default api_key is "ollama"); only
-        # send a real key for authenticated endpoints (e.g. Ollama Cloud).
-        if api_key and api_key != "ollama":
-            req.add_header("Authorization", f"Bearer {api_key}")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read())
-        # The context length lives at <architecture>.context_length (e.g.
-        # llama.context_length, nemotron-3-nano.context_length) — find any key
-        # ending in .context_length.
-        context = None
-        for k, v in (data.get("model_info") or {}).items():
-            if k.endswith(".context_length") and isinstance(v, int):
-                context = v
-                break
-        caps = []
-        for c in data.get("capabilities") or []:
-            if c == "tools":
-                caps.append("tool_use")
-            elif c == "vision":
-                caps.append("vision")
-        return context, caps
-    except Exception as e:
-        print(f"    could not fetch /api/show for {model}: {e}", file=sys.stderr)
-        return None, []
-
-
 def discover_openai(api_base, api_key=None, auth_type="bearer", timeout=10):
     """Query an OpenAI-compatible /v1/models endpoint.
 
@@ -239,12 +197,7 @@ def main():
     # ── Discover models for each endpoint ─────────────────────────────────────
     discovered_count = 0
     prefix_discovered = config.get("prefix_discovered_models", False)
-    # Optionally fetch per-model context + capabilities via /api/show (Ollama)
-    # so the LM Studio adapter can report real per-model values to the editor
-    # instead of a one-size-fits-all default.
-    fetch_model_info = config.get("fetch_model_info", False)
-    model_info_path = config.get("model_info_path")
-    model_info_map = {}
+
     for ep in endpoints:
         name = ep["name"]
         api_base = ep["api_base"]
@@ -261,9 +214,9 @@ def main():
         if discovery_type == "ollama":
             models = discover_ollama(connect_base)
         elif discovery_type == "anthropic":
-            models = discover_openai(api_base, api_key=api_key, auth_type="x-api-key")
+            models = discover_openai(connect_base, api_key=api_key, auth_type="x-api-key")
         elif discovery_type == "openai":
-            models = discover_openai(api_base, api_key=api_key, auth_type="bearer")
+            models = discover_openai(connect_base, api_key=api_key, auth_type="bearer")
         else:
             print(f"  Skipping {name}: unknown discovery type '{discovery_type}'",
                   file=sys.stderr)
@@ -284,7 +237,6 @@ def main():
                   file=sys.stderr)
 
         # ── Add discovered models to config ──────────────────────────────────
-        to_show = []  # (model, model_name) to query via /api/show
         for model in models:
             # Prefix the model_name with the endpoint name so the selector
             # shows which endpoint a model routes to (e.g.
@@ -324,39 +276,6 @@ def main():
                 entry["order"] = ep["order"]
             base_config["model_list"].append(entry)
             discovered_count += 1
-
-            # Collect Ollama models for per-model /api/show (context + caps).
-            if fetch_model_info and discovery_type == "ollama":
-                to_show.append((model, model_name))
-
-        # Fetch per-model context + capabilities via /api/show in parallel
-        # (5 at a time) so a large model list doesn't make discovery slow.
-        if to_show:
-            with ThreadPoolExecutor(max_workers=5) as ex:
-                futs = {
-                    ex.submit(show_ollama, connect_base, model, api_key): model_name
-                    for model, model_name in to_show
-                }
-                for fut in as_completed(futs):
-                    model_name = futs[fut]
-                    try:
-                        ctx, caps = fut.result()
-                    except Exception as e:
-                        print(f"    /api/show failed: {e}", file=sys.stderr)
-                        continue
-                    if ctx is not None or caps:
-                        model_info_map[model_name] = {
-                            "context": ctx,
-                            "capabilities": caps,
-                        }
-
-    # ── Write the per-model info sidecar (read by the LM Studio adapter) ──────
-    if fetch_model_info and model_info_path:
-        os.makedirs(os.path.dirname(model_info_path), exist_ok=True)
-        with open(model_info_path, "w") as f:
-            json.dump(model_info_map, f)
-        print(f"  Wrote per-model info for {len(model_info_map)} models "
-              f"to {model_info_path}", file=sys.stderr)
 
     # ── Write merged config (carrying .local domain names from the base) ──────
     merged_yaml = yaml.dump(base_config, default_flow_style=False, sort_keys=False)
